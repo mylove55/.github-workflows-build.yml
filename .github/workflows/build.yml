@@ -1,14 +1,10 @@
-name: Build SafariWipe dylib
-
-on:
-  push:
-  workflow_dispatch:
-
+name: Build SafariWipe
+on: [push, workflow_dispatch]
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Tạo mã nguồn SafariWipe.m có Nút bấm nổi
+      - name: Compile dylib
         run: |
           cat << 'EOF' > SafariWipe.m
           #import <Foundation/Foundation.h>
@@ -19,33 +15,23 @@ jobs:
           #import <CoreGraphics/CoreGraphics.h>
           #import <notify.h>
           #import <stdlib.h>
-
-          // Cửa sổ xuyên thấu: chỉ nhận cảm ứng tại vị trí nút bấm, mọi thao tác khác xuyên xuống Safari
           @interface SWFloatingWindow : UIWindow
           @property (nonatomic, strong) UIButton *fabButton;
           @end
-
           @implementation SWFloatingWindow
           - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-              if (!self.fabButton || self.fabButton.hidden || self.alpha < 0.01) {
-                  return NO;
-              }
+              if (!self.fabButton || self.fabButton.hidden || self.alpha < 0.01) return NO;
               CGPoint buttonPoint = [self convertPoint:point toView:self.fabButton];
               return [self.fabButton pointInside:buttonPoint withEvent:event];
           }
           @end
-
           static SWFloatingWindow *gOverlayWindow = nil;
-
           static void PerformSafariDeepWipe(BOOL shouldExitAfterWipe) {
               dispatch_async(dispatch_get_main_queue(), ^{
                   if (gOverlayWindow && gOverlayWindow.fabButton) {
                       [gOverlayWindow.fabButton setTitle:@"..." forState:UIControlStateNormal];
-                      gOverlayWindow.fabButton.backgroundColor = [UIColor colorWithWhite:0.2 alpha:0.9];
                       gOverlayWindow.fabButton.userInteractionEnabled = NO;
                   }
-
-                  // 1. Xóa toàn bộ các lớp dữ liệu Keychain của Safari
                   NSArray *secClasses = @[
                       (__bridge id)kSecClassGenericPassword,
                       (__bridge id)kSecClassInternetPassword,
@@ -53,176 +39,106 @@ jobs:
                       (__bridge id)kSecClassKey,
                       (__bridge id)kSecClassIdentity
                   ];
-
                   for (id secClass in secClasses) {
-                      NSDictionary *querySync = @{
-                          (__bridge id)kSecClass: secClass,
-                          (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny
-                      };
-                      SecItemDelete((__bridge CFDictionaryRef)querySync);
-
-                      NSDictionary *queryLocal = @{ (__bridge id)kSecClass: secClass };
-                      SecItemDelete((__bridge CFDictionaryRef)queryLocal);
+                      NSDictionary *q1 = @{(__bridge id)kSecClass: secClass, (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny};
+                      SecItemDelete((__bridge CFDictionaryRef)q1);
+                      NSDictionary *q2 = @{(__bridge id)kSecClass: secClass};
+                      SecItemDelete((__bridge CFDictionaryRef)q2);
                   }
-
-                  // 2. Xóa Cookies & URLCache
-                  NSHTTPCookieStorage *cookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
-                  for (NSHTTPCookie *cookie in [cookieStorage cookies]) {
-                      [cookieStorage deleteCookie:cookie];
-                  }
+                  NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+                  for (NSHTTPCookie *c in [cs cookies]) { [cs deleteCookie:c]; }
                   [[NSURLCache sharedURLCache] removeAllCachedResponses];
-
-                  // 3. Xóa NSUserDefaults
-                  NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-                  if (bundleID) {
-                      [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleID];
+                  NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+                  if (bid) {
+                      [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
                       [[NSUserDefaults standardUserDefaults] synchronize];
                   }
-
-                  // 4. Xóa dữ liệu lưu trong Sandbox Container
                   NSFileManager *fm = [NSFileManager defaultManager];
-                  NSString *homeDir = NSHomeDirectory();
-                  NSArray *subPaths = @[@"Library/Caches", @"Library/Cookies", @"Library/WebKit", @"Library/Safari", @"tmp"];
-                  for (NSString *relPath in subPaths) {
-                      NSString *fullPath = [homeDir stringByAppendingPathComponent:relPath];
-                      NSArray *contents = [fm contentsOfDirectoryAtPath:fullPath error:nil];
-                      for (NSString *item in contents) {
-                          [fm removeItemAtPath:[fullPath stringByAppendingPathComponent:item] error:nil];
+                  NSString *home = NSHomeDirectory();
+                  NSArray *paths = @[@"Library/Caches", @"Library/Cookies", @"Library/WebKit", @"Library/Safari", @"tmp"];
+                  for (NSString *rel in paths) {
+                      NSString *full = [home stringByAppendingPathComponent:rel];
+                      NSArray *items = [fm contentsOfDirectoryAtPath:full error:nil];
+                      for (NSString *item in items) {
+                          [fm removeItemAtPath:[full stringByAppendingPathComponent:item] error:nil];
                       }
                   }
-
-                  // Bộ đếm dự phòng: Đảm bảo đóng Safari sau 1.2 giây kể cả khi tiến trình WebKit bị treo
                   if (shouldExitAfterWipe) {
-                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                          exit(0);
-                      });
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ exit(0); });
                   }
-
-                  // 5. Xóa sạch WKWebsiteDataStore (IndexedDB, LocalStorage, WebKit Cookies)
                   NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
                   NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
-                  [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:allTypes
-                                                             modifiedSince:epoch
-                                                         completionHandler:^{
-                      if (shouldExitAfterWipe) {
-                          exit(0);
-                      }
+                  [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
+                      if (shouldExitAfterWipe) exit(0);
                   }];
               });
           }
-
           @interface SWFloatingController : NSObject
           + (instancetype)shared;
           - (void)setupFloatingButtonIfNeeded;
           @end
-
           @implementation SWFloatingController
-
           + (instancetype)shared {
-              static SWFloatingController *instance = nil;
+              static SWFloatingController *inst = nil;
               static dispatch_once_t onceToken;
-              dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
-              return instance;
+              dispatch_once(&onceToken, ^{ inst = [[self alloc] init]; });
+              return inst;
           }
-
           - (void)setupFloatingButtonIfNeeded {
               if (gOverlayWindow != nil) return;
-
               UIWindowScene *targetScene = nil;
               for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                  if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+                  if ([scene isKindOfClass:[UIWindowScene class]]) {
                       targetScene = (UIWindowScene *)scene;
-                      break;
+                      if (scene.activationState == UISceneActivationStateForegroundActive) break;
                   }
               }
-              if (!targetScene) {
-                  for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                      if ([scene isKindOfClass:[UIWindowScene class]]) {
-                          targetScene = (UIWindowScene *)scene;
-                          break;
-                      }
-                  }
-              }
-
-              CGRect screenBounds = [UIScreen mainScreen].bounds;
+              CGRect bounds = [UIScreen mainScreen].bounds;
               if (targetScene) {
                   gOverlayWindow = [[SWFloatingWindow alloc] initWithWindowScene:targetScene];
-                  gOverlayWindow.frame = screenBounds;
+                  gOverlayWindow.frame = bounds;
               } else {
-                  gOverlayWindow = [[SWFloatingWindow alloc] initWithFrame:screenBounds];
+                  gOverlayWindow = [[SWFloatingWindow alloc] initWithFrame:bounds];
               }
-
-              UIViewController *rootVC = [[UIViewController alloc] init];
-              rootVC.view.backgroundColor = [UIColor clearColor];
-              gOverlayWindow.rootViewController = rootVC;
+              UIViewController *vc = [[UIViewController alloc] init];
+              vc.view.backgroundColor = [UIColor clearColor];
+              gOverlayWindow.rootViewController = vc;
               gOverlayWindow.backgroundColor = [UIColor clearColor];
               gOverlayWindow.windowLevel = UIWindowLevelAlert + 100.0;
               gOverlayWindow.hidden = NO;
-
-              // Khởi tạo nút bấm nổi (Kích thước 50x50, mặc định nằm sát mép phải ở tọa độ Y = 160)
-              CGFloat btnSize = 50.0;
+              CGFloat sz = 50.0;
               UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-              btn.frame = CGRectMake(screenBounds.size.width - btnSize - 12.0, 160.0, btnSize, btnSize);
+              btn.frame = CGRectMake(bounds.size.width - sz - 12.0, 160.0, sz, sz);
               btn.backgroundColor = [UIColor colorWithRed:0.86 green:0.15 blue:0.18 alpha:0.90];
               [btn setTitle:@"WIPE" forState:UIControlStateNormal];
               [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
               btn.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightHeavy];
-
-              btn.layer.cornerRadius = btnSize / 2.0;
+              btn.layer.cornerRadius = sz / 2.0;
               btn.layer.borderWidth = 1.5;
-              btn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.8].CGColor;
-              btn.layer.shadowColor = [UIColor blackColor].CGColor;
-              btn.layer.shadowOffset = CGSizeMake(0, 2);
-              btn.layer.shadowOpacity = 0.4;
-              btn.layer.shadowRadius = 4.0;
-
-              [btn addTarget:self action:@selector(onWipeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-
-              UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onButtonPanned:)];
+              btn.layer.borderColor = [UIColor whiteColor].CGColor;
+              [btn addTarget:self action:@selector(onWipeTapped:) forControlEvents:UIControlEventTouchUpInside];
+              UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanned:)];
               [btn addGestureRecognizer:pan];
-
-              [rootVC.view addSubview:btn];
+              [vc.view addSubview:btn];
               gOverlayWindow.fabButton = btn;
           }
-
-          - (void)onWipeButtonTapped:(UIButton *)sender {
-              PerformSafariDeepWipe(YES);
-          }
-
-          - (void)onButtonPanned:(UIPanGestureRecognizer *)pan {
+          - (void)onWipeTapped:(UIButton *)sender { PerformSafariDeepWipe(YES); }
+          - (void)onPanned:(UIPanGestureRecognizer *)pan {
               UIView *btn = pan.view;
               if (!btn || !btn.superview) return;
-
-              CGPoint translation = [pan translationInView:btn.superview];
-              CGPoint newCenter = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
-
-              CGRect bounds = btn.superview.bounds;
-              CGFloat halfW = btn.bounds.size.width / 2.0 + 6.0;
-              CGFloat halfH = btn.bounds.size.height / 2.0 + 40.0;
-
-              newCenter.x = MAX(halfW, MIN(bounds.size.width - halfW, newCenter.x));
-              newCenter.y = MAX(halfH, MIN(bounds.size.height - halfH, newCenter.y));
-
-              btn.center = newCenter;
+              CGPoint trans = [pan translationInView:btn.superview];
+              btn.center = CGPointMake(btn.center.x + trans.x, btn.center.y + trans.y);
               [pan setTranslation:CGPointZero inView:btn.superview];
           }
-
           @end
-
           __attribute__((constructor))
           static void SafariWipeInit(void) {
               @autoreleasepool {
-                  // 1. Vẫn hỗ trợ gọi từ script ngầm: notifyutil -p com.custom.safari.wipe
-                  int outToken = 0;
-                  notify_register_dispatch("com.custom.safari.wipe", &outToken, dispatch_get_main_queue(), ^(int token) {
+                  int token = 0;
+                  notify_register_dispatch("com.custom.safari.wipe", &token, dispatch_get_main_queue(), ^(int t) {
                       PerformSafariDeepWipe(YES);
                   });
-
-                  // 2. Hiển thị nút bấm nổi khi Safari mở lên
-                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                                    object:nil
-                                                                     queue:[NSOperationQueue mainQueue]
-                                                                usingBlock:^(NSNotification * _Nonnull note) {
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
                       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                           [[SWFloatingController shared] setupFloatingButtonIfNeeded];
                       });
@@ -230,18 +146,9 @@ jobs:
               }
           }
           EOF
-
-      - name: Biên dịch và ký SafariWipe.dylib
-        run: |
-          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc \
-            -miphoneos-version-min=15.0 \
-            -Wno-deprecated-declarations \
-            -install_name @rpath/SafariWipe.dylib \
-            -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics \
-            SafariWipe.m -o SafariWipe.dylib
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc -miphoneos-version-min=15.0 -Wno-deprecated-declarations -install_name @rpath/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics SafariWipe.m -o SafariWipe.dylib
           codesign -f -s - SafariWipe.dylib
-
-      - name: Xuất file SafariWipe.dylib
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: SafariWipe-dylib
